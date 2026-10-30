@@ -1,7 +1,7 @@
 {
   "name": "ccv-realtime-collection-web",
   "private": true,
-  "description": "Optional Playwright runtime for Twitch/YouTube web CCV pilots",
+  "description": "Optional Playwright runtime for Twitch web CCV collection",
   "dependencies": {
     "playwright": "^1.56.0"
   }

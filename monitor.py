@@ -230,6 +230,8 @@ class Monitor:
         self.session_raw_path: Path | None = None
         self.session_started_at: datetime | None = None
         self.last_live_count = 0
+        self._phase = "waiting" if self.cfg.get("channels") else "live"
+        self._offline_streak = 0
         for d in (self.data_dir, self.raw_dir, self.streams_dir, self.charts_dir):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -326,7 +328,7 @@ class Monitor:
     def write_heartbeat(self, now: datetime, live_count: int) -> None:
         duration_minutes = int(self.cfg.get("monitor_duration_minutes", 0) or 0)
         remaining_seconds = None
-        if duration_minutes > 0 and self.session_started_at:
+        if self.duration_limit_applies() and duration_minutes > 0 and self.session_started_at:
             elapsed = (now - self.session_started_at).total_seconds()
             remaining_seconds = max(0, int(duration_minutes * 60 - elapsed))
         heartbeat = {
@@ -339,6 +341,10 @@ class Monitor:
             "live_count": live_count,
             "tracked_total": len(self.state["streams"]),
             "poll_interval_seconds": self.cfg.get("poll_interval_seconds", 30),
+            "phase": self.current_phase(),
+            "watch_interval_seconds": self._watch_interval_seconds(),
+            "live_interval_seconds": self._live_interval_seconds(),
+            "next_interval_seconds": self.current_interval_seconds(),
         }
         tmp = self.data_dir / "heartbeat.json.tmp"
         tmp.write_text(json.dumps(heartbeat, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -393,26 +399,64 @@ class Monitor:
         )
 
     # ---------- 主循环 ----------
+    def is_channel_watch(self) -> bool:
+        return bool(self.cfg.get("channels"))
+
+    def _watch_interval_seconds(self) -> int:
+        legacy = max(5, int(self.cfg.get("poll_interval_seconds", 30) or 30))
+        return max(5, int(self.cfg.get("watch_interval_seconds", legacy) or legacy))
+
+    def _live_interval_seconds(self) -> int:
+        legacy = max(5, int(self.cfg.get("poll_interval_seconds", 30) or 30))
+        return max(5, int(self.cfg.get("live_interval_seconds", legacy) or legacy))
+
+    def current_phase(self) -> str:
+        return self._phase if self.is_channel_watch() else "live"
+
+    def current_interval_seconds(self) -> int:
+        return self._watch_interval_seconds() if self.current_phase() == "waiting" else self._live_interval_seconds()
+
+    def duration_limit_applies(self) -> bool:
+        return not self.is_channel_watch()
+
+    def record_channel_observation(self, observed_live_count: int) -> bool:
+        if not self.is_channel_watch():
+            self._phase = "live"
+            self._offline_streak = 0
+            return observed_live_count == 0
+        if observed_live_count > 0:
+            self._phase = "live"
+            self._offline_streak = 0
+            return False
+        if self._phase == "live":
+            self._offline_streak += 1
+            if self._offline_streak >= 2:
+                self._phase = "waiting"
+                self._offline_streak = 0
+                return True
+        return False
+
     def tick(self) -> None:
         now = utcnow()
-        if self._game_id is None:
-            self._game_id = self.client.resolve_game_id(self.cfg["game_name"], self.cfg.get("game_id"))
-            logging.info("游戏解析成功: %s (id=%s)", self.cfg["game_name"], self._game_id)
-        game_id = self._game_id
         languages = self.cfg.get("languages") or []
         channel_whitelist = [c.strip().lower() for c in (self.cfg.get("channels") or []) if c.strip()]
         max_streams = int(self.cfg.get("max_streams", 0) or 0)
-        streams = self.client.get_live_streams(game_id, self.cfg.get("max_stream_pages", 10))
+        channel_query_failed = False
         if channel_whitelist:
-            # 频道任务：直接按主播查询，不限于鸣潮分类
             all_streams: list[dict[str, Any]] = []
             for login in channel_whitelist:
                 try:
                     data = self.client.get("/streams", {"user_login": login})
                     all_streams.extend(data.get("data", []))
                 except Exception as exc:  # noqa: BLE001
+                    channel_query_failed = True
                     logging.warning("查询频道 %s 失败: %s", login, exc)
             streams = all_streams
+        else:
+            if self._game_id is None:
+                self._game_id = self.client.resolve_game_id(self.cfg["game_name"], self.cfg.get("game_id"))
+                logging.info("游戏解析成功: %s (id=%s)", self.cfg["game_name"], self._game_id)
+            streams = self.client.get_live_streams(self._game_id, self.cfg.get("max_stream_pages", 10))
 
         # 语言过滤
         streams = [
@@ -439,6 +483,15 @@ class Monitor:
             selected = list(keep.values())
         else:
             selected = streams
+
+        if channel_whitelist and self._phase == "waiting" and any(
+            stream.get("status") == "live" for stream in self.state["streams"].values()
+        ):
+            self._phase = "live"
+        if channel_whitelist and not channel_query_failed:
+            offline_confirmed = self.record_channel_observation(len(selected))
+        else:
+            offline_confirmed = not channel_whitelist
 
         seen_ids: set[str] = set()
         for s in selected:
@@ -514,6 +567,8 @@ class Monitor:
         # 下播检测
         for stream_id in list(self.state["streams"].keys()):
             if stream_id not in seen_ids and self.state["streams"][stream_id].get("status") == "live":
+                if channel_whitelist and not offline_confirmed:
+                    continue
                 self.finalize_stream(stream_id, "ended", now)
 
         self.save_state()
@@ -554,12 +609,9 @@ class Monitor:
                     logging.info("清理了残留的任务控制标记: %s", flag.name)
                 except OSError:
                     pass
-        interval = max(5, int(self.cfg.get("poll_interval_seconds", 30)))
         duration_minutes = int(self.cfg.get("monitor_duration_minutes", 0) or 0)
         duration_secs = duration_minutes * 60 if duration_minutes > 0 else 0
         session_started = time.monotonic()
-        seen_live = False
-        offline_streak = 0
         while not self._stopping:
             if stop_flag.exists() or task_stop_flag.exists():
                 logging.info("检测到 stop.flag，正在优雅停止...")
@@ -581,41 +633,39 @@ class Monitor:
                 self.tick()
             except Exception as exc:  # noqa: BLE001
                 logging.exception("本轮采集异常: %s", exc)
-            # 开播守望: 开播自动采集（tick 已覆盖），连续 2 轮无人观看后自动停止
-            if self.cfg.get("auto_stop_on_offline"):
-                if self.last_live_count > 0:
-                    seen_live = True
-                    offline_streak = 0
-                elif seen_live:
-                    offline_streak += 1
-                    if offline_streak >= 2:
-                        logging.info("检测到下播，守望任务自动结束")
-                        self._normal_exit = True
-                        self.stop(status="completed")
-                        break
             if once:
                 self._normal_exit = True
                 self._session_status = "completed"
                 break
             elapsed_total = time.monotonic() - session_started
-            if duration_secs > 0 and elapsed_total >= duration_secs:
+            if self.duration_limit_applies() and duration_secs > 0 and elapsed_total >= duration_secs:
                 logging.info("达到监测时长 %s 分钟，正常结束", duration_minutes)
                 self._normal_exit = True
                 self.stop(status="completed")
                 break
-            if duration_secs > 0 and self.last_live_count == 0:
+            if self.duration_limit_applies() and duration_secs > 0 and self.last_live_count == 0:
                 logging.info("所有跟踪直播已结束，提前结束")
                 self._normal_exit = True
                 self.stop(status="completed")
                 break
             elapsed = time.monotonic() - started
-            sleep_for = max(1, interval - elapsed)
+            sleep_for = max(1, self.current_interval_seconds() - elapsed)
             if self._stopping:
                 break
-            time.sleep(sleep_for)
+            self._wait_for_next_tick(sleep_for, stop_flag, task_stop_flag, task_pause_flag)
         self.end_session()
         if self._normal_exit and self.cfg.get("auto_charts_on_exit"):
             self.run_charts()
+
+    def _wait_for_next_tick(self, seconds: float, *control_flags: Path) -> None:
+        deadline = time.monotonic() + max(0, seconds)
+        while not self._stopping:
+            if any(flag.exists() for flag in control_flags):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(1.0, remaining))
 
     def run_charts(self) -> None:
         logging.info("会话结束，自动生成图表...")
