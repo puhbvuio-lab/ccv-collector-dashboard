@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from openpyxl import load_workbook
+from openpyxl.chart.axis import TextAxis
 
 import server
 
@@ -56,7 +57,7 @@ class ExcelExportTests(unittest.TestCase):
             workbook = load_workbook(BytesIO(payload))
             sheet = workbook["采样数据"]
             self.assertEqual(
-                ["采样时间（北京时间）", "直播链接", "主播名称", "直播标题", "CCV", "直播场次ID"],
+                ["采样时间（北京时间）", "直播链接", "主播名称", "直播标题", "CCV", "直播场次ID", "时间标签（图表用）"],
                 [cell.value for cell in sheet[1]],
             )
             self.assertEqual(real_datetime(2026, 10, 30, 8, 0), sheet["A2"].value)
@@ -108,7 +109,19 @@ class ExcelExportTests(unittest.TestCase):
             self.assertEqual(2, len(chart.series))
             self.assertEqual("'采样数据'!$E$2:$E$3", chart.series[0].val.numRef.f)
             self.assertEqual("'采样数据'!$E$4:$E$5", chart.series[1].val.numRef.f)
-            self.assertEqual("'采样数据'!$A$2:$A$3", chart.series[0].cat.numRef.f)
+            # 横轴必须用文本分类轴（strRef 指向隐藏标签列 G），不能用日期轴：
+            # WPS/Excel 对 dateAx 自动按"天"缩放，会把数小时数据压成一条竖线
+            self.assertIsInstance(chart.x_axis, TextAxis)
+            self.assertEqual("'采样数据'!$G$2:$G$3", chart.series[0].cat.strRef.f)
+            self.assertEqual("'采样数据'!$G$4:$G$5", chart.series[1].cat.strRef.f)
+            self.assertIsNotNone(chart.x_axis.tickLblSkip)
+            self.assertGreaterEqual(chart.x_axis.tickLblSkip, 1)
+            self.assertFalse(chart.visible_cells_only)
+            # 隐藏标签列实际存在且为文本
+            sample_sheet = workbook["采样数据"]
+            self.assertEqual("10-30 08:00:00", sample_sheet["G2"].value)
+            self.assertEqual("10-30 08:00:30", sample_sheet["G3"].value)
+            self.assertTrue(sample_sheet.column_dimensions["G"].hidden)
             self.assertEqual("采样时间（北京时间）", chart.x_axis.title.tx.rich.p[0].r[0].t)
             self.assertEqual("CCV", chart.y_axis.title.tx.rich.p[0].r[0].t)
             workbook.close()

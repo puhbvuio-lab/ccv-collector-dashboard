@@ -561,8 +561,7 @@ class TaskManager:
 
         from openpyxl import Workbook
         from openpyxl.chart import LineChart, Reference, Series
-        from openpyxl.chart.axis import DateAxis
-        from openpyxl.chart.data_source import AxDataSource, NumRef
+        from openpyxl.chart.data_source import AxDataSource, StrRef
         from openpyxl.styles import Font
 
         streams = self.list_streams(task_id)
@@ -595,7 +594,7 @@ class TaskManager:
         wb = Workbook()
         ws = wb.active
         ws.title = "采样数据"
-        ws.append(["采样时间（北京时间）", "直播链接", "主播名称", "直播标题", "CCV", "直播场次ID"])
+        ws.append(["采样时间（北京时间）", "直播链接", "主播名称", "直播标题", "CCV", "直播场次ID", "时间标签（图表用）"])
         for cell in ws[1]:
             cell.font = Font(bold=True)
 
@@ -614,9 +613,11 @@ class TaskManager:
                         ccv = float(row.get("viewer_count") or "")
                     except (TypeError, ValueError):
                         continue
+                    time_cell = beijing_time(row.get("ts_utc", ""))
+                    time_label = time_cell.strftime("%m-%d %H:%M:%S") if isinstance(time_cell, datetime) else str(time_cell)
                     ws.append(
                         [
-                            beijing_time(row.get("ts_utc", "")),
+                            time_cell,
                             f"https://www.twitch.tv/{quote(channel, safe='')}",
                             display_name,
                             excel_safe_text(row.get("title") or fallback_title),
@@ -626,6 +627,7 @@ class TaskManager:
                     )
                     row_number = ws.max_row
                     ws.cell(row_number, 1).number_format = "yyyy-mm-dd hh:mm:ss"
+                    ws.cell(row_number, 7).value = time_label
                     link_cell = ws.cell(row_number, 2)
                     link_cell.hyperlink = link_cell.value
                     link_cell.style = "Hyperlink"
@@ -640,6 +642,7 @@ class TaskManager:
         ws.column_dimensions["D"].width = 48
         ws.column_dimensions["E"].width = 12
         ws.column_dimensions["F"].width = 20
+        ws.column_dimensions["G"].hidden = True  # 图表用文本标签列，隐藏不碍观感
 
         chart_ws = wb.create_sheet("CCV趋势图")
         chart_ws["A1"] = "Excel 原生图表：可编辑标题、坐标轴、样式和数据范围"
@@ -650,16 +653,24 @@ class TaskManager:
             chart.style = 13
             chart.height = 14
             chart.width = 28
-            chart.x_axis = DateAxis(crossAx=100)
+            # 用文本分类轴（CatAx）而不是日期轴（dateAx）：WPS/Excel 对 dateAx
+            # 的自动缩放处理不一致（按"天"缩放会把数小时的数据压成一条竖线）。
+            # 分类轴每点等距、引用隐藏的文本标签列，任何渲染器都稳定。
             chart.x_axis.title = "采样时间（北京时间）"
-            chart.x_axis.number_format = "yyyy-mm-dd hh:mm:ss"
+            first_count = chart_ranges[0][1] - chart_ranges[0][0] + 1
+            skip = max(1, round(first_count / 8))
+            chart.x_axis.tickLblSkip = skip
+            chart.x_axis.tickMarkSkip = skip
+            chart.x_axis.delete = False
             chart.y_axis.title = "CCV"
             chart.y_axis.scaling.min = 0
+            chart.y_axis.delete = False
+            chart.visible_cells_only = False  # 标签列 G 被隐藏，仍需参与绘图
             for first_row, last_row, display_name, stream_id in chart_ranges:
                 values = Reference(ws, min_col=5, min_row=first_row, max_row=last_row)
-                times = Reference(ws, min_col=1, min_row=first_row, max_row=last_row)
+                labels = Reference(ws, min_col=7, min_row=first_row, max_row=last_row)
                 series = Series(values, title=f"{display_name} · {stream_id}")
-                series.cat = AxDataSource(numRef=NumRef(f=str(times)))
+                series.cat = AxDataSource(strRef=StrRef(f=str(labels)))
                 chart.series.append(series)
             chart_ws.add_chart(chart, "A3")
 

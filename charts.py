@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """从采集数据生成图表。
 
-生成:
-  charts/per_stream/<channel>_<stream_id>.png   每场直播 CCV 曲线
-  charts/overview_<时间>.png                    全部直播 CCV 曲线对比（按开播后分钟对齐）
-  charts/summary_<时间>.png                     各主播峰值 CCV 柱状图
+对每个任务目录 data/<task_id>/ 生成:
+  charts/<task_id>/<channel>_<stream_id>.png   每场直播 CCV 曲线
+  charts/<task_id>/overview_<时间>.png         该任务全部直播 CCV 曲线对比（按开播后分钟对齐）
+  charts/<task_id>/summary_<时间>.png          该任务各主播峰值 CCV 柱状图
 
 用法:
-  python charts.py
+  python charts.py                                          # 扫描全部任务目录出图
+  python charts.py --data-dir data/<task_id> --out-dir charts/<task_id>
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 from datetime import datetime, timezone
@@ -76,8 +78,8 @@ def read_stream_csv(path: Path) -> pd.DataFrame:
     return df.dropna(subset=["viewer_count"])
 
 
-def read_summary() -> pd.DataFrame:
-    summary = BASE_DIR / "data" / "streams_summary.csv"
+def read_summary(data_dir: Path) -> pd.DataFrame:
+    summary = data_dir / "streams_summary.csv"
     if not summary.exists():
         return pd.DataFrame()
     return pd.read_csv(summary, encoding="utf-8-sig")
@@ -126,7 +128,7 @@ def plot_overview(streams: list[tuple[pd.DataFrame, dict]], out_dir: Path) -> Pa
         label = f"{meta.get('channel')} (峰值 {int(df['viewer_count'].max())})"
         ax.plot(minutes, df["viewer_count"], linewidth=1.3, label=label if index < legend_limit else None)
     extra = len(streams_sorted) - legend_limit
-    title = "鸣潮直播 CCV 对比（按开播后分钟对齐）"
+    title = "直播 CCV 对比（按开播后分钟对齐）"
     if extra > 0:
         title += f"（图例仅显示峰值前 {legend_limit} 场，其余 {extra} 场略）"
     ax.set_title(title, fontsize=13)
@@ -150,7 +152,7 @@ def plot_summary(summary: pd.DataFrame, out_dir: Path) -> Path:
     bars = ax.bar(summary["channel"], summary["peak_ccv"], color=colors)
     for bar, value in zip(bars, summary["peak_ccv"]):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), str(int(value)), ha="center", va="bottom", fontsize=8)
-    ax.set_title("各主播鸣潮直播峰值 CCV（红=直播中，蓝=已结束）", fontsize=13)
+    ax.set_title("各主播直播峰值 CCV（红=直播中，蓝=已结束）", fontsize=13)
     ax.set_ylabel("峰值 CCV")
     ax.grid(axis="y", alpha=0.3)
     fig.autofmt_xdate()
@@ -161,18 +163,14 @@ def plot_summary(summary: pd.DataFrame, out_dir: Path) -> Path:
     return out
 
 
-def main() -> None:
-    cfg = load_config()
-    tz = local_tz(cfg)
-    streams_dir = BASE_DIR / "data" / "streams"
-    out_dir = BASE_DIR / "charts"
+def build_charts(data_dir: Path, out_dir: Path, tz: ZoneInfo) -> int:
+    """为单个任务数据目录生成图表，返回生成场次图的数量。"""
+    streams_dir = data_dir / "streams"
     out_dir.mkdir(parents=True, exist_ok=True)
-
     if not streams_dir.exists():
-        print("没有找到采集数据（data/streams）。先用演示数据: python demo_data.py，或配置 .env 后运行 python monitor.py")
-        return
+        return 0
 
-    summary = read_summary()
+    summary = read_summary(data_dir)
     meta_map: dict[str, dict] = {}
     if not summary.empty:
         for _, row in summary.iterrows():
@@ -191,19 +189,47 @@ def main() -> None:
         streams.append((df, meta))
 
     if not streams:
-        print("data/streams 下没有可用的时序数据")
+        return 0
+
+    plot_overview(streams, out_dir)
+    if not summary.empty:
+        plot_summary(summary, out_dir)
+    return len(streams)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="从采集数据生成 CCV 趋势图表")
+    parser.add_argument("--data-dir", default=None, help="指定任务数据目录（如 data/twitch_zrush_165300），默认扫描全部任务")
+    parser.add_argument("--out-dir", default=None, help="图表输出目录，默认 charts/<任务ID>/")
+    args = parser.parse_args()
+
+    cfg = load_config()
+    tz = local_tz(cfg)
+    base = BASE_DIR / cfg.get("data_dir", "data")
+    charts_root = BASE_DIR / cfg.get("charts_dir", "charts")
+
+    if args.data_dir:
+        data_dirs = [Path(args.data_dir)]
+    else:
+        data_dirs = sorted(
+            [d for d in base.iterdir() if d.is_dir() and (d / "streams_summary.csv").exists()]
+        )
+
+    if not data_dirs:
+        print("没有找到采集数据。请先运行采集，或指定 --data-dir")
         return
 
-    overview = plot_overview(streams, out_dir)
-    if not summary.empty:
-        summary_png = plot_summary(summary, out_dir)
-    else:
-        summary_png = None
+    total = 0
+    for data_dir in data_dirs:
+        out_dir = Path(args.out_dir) if args.out_dir else (charts_root / data_dir.name)
+        n = build_charts(data_dir, out_dir, tz)
+        if n:
+            print(f"[{data_dir.name}] 单场图 {n} 张 -> {out_dir}")
+            total += n
+        else:
+            print(f"[{data_dir.name}] 无可用时序数据，跳过")
 
-    print(f"单场图表: {len(streams)} 张 -> {out_dir}")
-    print(f"总览图表: {overview}")
-    if summary_png:
-        print(f"汇总图表: {summary_png}")
+    print(f"完成：共 {len(data_dirs)} 个任务目录，{total} 场直播出图")
 
 
 if __name__ == "__main__":

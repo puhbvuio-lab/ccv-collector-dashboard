@@ -13,3 +13,7 @@ server.log*
 *.inspect.ndjson
 *.tmp
 _tmp_*.js
+验证导出_*.xlsx
+_check.xlsx
+_preview.png
+_srv.*

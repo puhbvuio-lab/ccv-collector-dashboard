@@ -673,7 +673,14 @@ class Monitor:
         env["PYTHONIOENCODING"] = "utf-8"
         try:
             result = subprocess.run(
-                [sys.executable, str(BASE_DIR / "charts.py")],
+                [
+                    sys.executable,
+                    str(BASE_DIR / "charts.py"),
+                    "--data-dir",
+                    str(self.data_dir),
+                    "--out-dir",
+                    str(self.charts_dir),
+                ],
                 cwd=BASE_DIR,
                 env=env,
                 capture_output=True,
